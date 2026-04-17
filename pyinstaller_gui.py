@@ -1,15 +1,16 @@
 import sys
 import os
+import ast
 import shlex
 import subprocess
+from pathlib import Path
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QLineEdit, QPushButton, QFileDialog, QGroupBox,
-    QRadioButton, QCheckBox, QPlainTextEdit, QButtonGroup,
-    QSizePolicy
+    QRadioButton, QPlainTextEdit, QButtonGroup, QSizePolicy
 )
 from PySide6.QtCore import Qt, QThread, Signal
-from PySide6.QtGui import QColor, QTextCharFormat
+from PySide6.QtGui import QColor, QTextCharFormat, QIcon
 
 
 STYLESHEET = """
@@ -80,11 +81,11 @@ QPushButton#buildBtn:pressed {
 QPushButton#buildBtn:disabled {
     background-color: #80BDE5;
 }
-QRadioButton, QCheckBox {
+QRadioButton {
     spacing: 6px;
     font-size: 13px;
 }
-QRadioButton::indicator, QCheckBox::indicator {
+QRadioButton::indicator {
     width: 15px; height: 15px;
 }
 QPlainTextEdit {
@@ -102,14 +103,61 @@ QLabel#statusLabel {
 }
 """
 
+STDLIB_MODULES: set[str] = set(sys.stdlib_module_names) if hasattr(sys, "stdlib_module_names") else {
+    "abc", "aifc", "argparse", "array", "ast", "asynchat", "asyncio", "asyncore",
+    "atexit", "base64", "bdb", "binascii", "binhex", "bisect", "builtins",
+    "bz2", "calendar", "cgi", "cgitb", "chunk", "cmath", "cmd", "code",
+    "codecs", "codeop", "collections", "colorsys", "compileall", "concurrent",
+    "configparser", "contextlib", "contextvars", "copy", "copyreg", "cProfile",
+    "crypt", "csv", "ctypes", "curses", "dataclasses", "datetime", "dbm",
+    "decimal", "difflib", "dis", "distutils", "doctest", "email", "encodings",
+    "enum", "errno", "faulthandler", "fcntl", "filecmp", "fileinput", "fnmatch",
+    "fractions", "ftplib", "functools", "gc", "getopt", "getpass", "gettext",
+    "glob", "grp", "gzip", "hashlib", "heapq", "hmac", "html", "http",
+    "idlelib", "imaplib", "imghdr", "imp", "importlib", "inspect", "io",
+    "ipaddress", "itertools", "json", "keyword", "lib2to3", "linecache",
+    "locale", "logging", "lzma", "mailbox", "mailcap", "marshal", "math",
+    "mimetypes", "mmap", "modulefinder", "multiprocessing", "netrc", "nis",
+    "nntplib", "numbers", "operator", "optparse", "os", "ossaudiodev",
+    "pathlib", "pdb", "pickle", "pickletools", "pipes", "pkgutil", "platform",
+    "plistlib", "poplib", "posix", "posixpath", "pprint", "profile", "pstats",
+    "pty", "pwd", "py_compile", "pyclbr", "pydoc", "queue", "quopri",
+    "random", "re", "readline", "reprlib", "resource", "rlcompleter", "runpy",
+    "sched", "secrets", "select", "selectors", "shelve", "shlex", "shutil",
+    "signal", "site", "smtpd", "smtplib", "sndhdr", "socket", "socketserver",
+    "spwd", "sqlite3", "sre_compile", "sre_constants", "sre_parse", "ssl",
+    "stat", "statistics", "string", "stringprep", "struct", "subprocess",
+    "sunau", "symtable", "sys", "sysconfig", "syslog", "tabnanny", "tarfile",
+    "telnetlib", "tempfile", "termios", "test", "textwrap", "threading",
+    "time", "timeit", "tkinter", "token", "tokenize", "trace", "traceback",
+    "tracemalloc", "tty", "turtle", "turtledemo", "types", "typing",
+    "unicodedata", "unittest", "urllib", "uu", "uuid", "venv", "warnings",
+    "wave", "weakref", "webbrowser", "winreg", "winsound", "wsgiref",
+    "xdrlib", "xml", "xmlrpc", "zipapp", "zipfile", "zipimport", "zlib",
+    "_thread", "__future__",
+}
 
-def _pip_exe() -> str:
-    """Путь к pip текущего интерпретатора."""
-    scripts = os.path.dirname(sys.executable)
-    pip = os.path.join(scripts, "pip.exe" if sys.platform == "win32" else "pip")
-    if os.path.isfile(pip):
-        return pip
-    return pip
+
+def detect_imports(py_path: str) -> list[str]:
+    try:
+        source = Path(py_path).read_text(encoding="utf-8", errors="replace")
+        tree = ast.parse(source, filename=py_path)
+    except Exception:
+        return []
+
+    top_level: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                top_level.add(alias.name.split(".")[0])
+        elif isinstance(node, ast.ImportFrom):
+            if node.module and node.level == 0:
+                top_level.add(node.module.split(".")[0])
+
+    return sorted(
+        pkg for pkg in top_level
+        if pkg not in STDLIB_MODULES and not pkg.startswith("_")
+    )
 
 
 def _popen_flags() -> int:
@@ -185,7 +233,6 @@ class BuildWorker(QThread):
         if not self._ensure_pyinstaller():
             self.finished_signal.emit(-1)
             return
-
         code = self._run_process(self.command, "PyInstaller")
         self.finished_signal.emit(code)
 
@@ -197,11 +244,11 @@ class MainWindow(QMainWindow):
         self.setMinimumSize(720, 780)
         self.resize(780, 860)
         self.worker: BuildWorker | None = None
+        self._detected_packages: list[str] = []
         self._build_ui()
         self._connect_signals()
         self._update_build_btn()
 
-    # ── UI ──────────────────────────────────────────────────────────
     def _build_ui(self):
         central = QWidget()
         self.setCentralWidget(central)
@@ -209,7 +256,7 @@ class MainWindow(QMainWindow):
         root.setContentsMargins(16, 12, 16, 12)
         root.setSpacing(8)
 
-        # Input
+        # ── Исходный файл ──
         grp_input = QGroupBox("Исходный файл")
         h = QHBoxLayout(grp_input)
         h.setContentsMargins(10, 8, 10, 8)
@@ -223,19 +270,17 @@ class MainWindow(QMainWindow):
         h.addWidget(btn_browse)
         root.addWidget(grp_input)
 
-        # Build Settings
+        # ── Build Settings ──
         grp_build = QGroupBox("Build Settings")
         g = QVBoxLayout(grp_build)
         g.setContentsMargins(10, 8, 10, 8)
         g.setSpacing(6)
-
         row1 = QHBoxLayout()
         row1.addWidget(QLabel("Имя выходного файла:"))
         self.output_name = QLineEdit()
         self.output_name.setPlaceholderText("my_app")
         row1.addWidget(self.output_name)
         g.addLayout(row1)
-
         row2 = QHBoxLayout()
         row2.addWidget(QLabel("Директория сохранения:"))
         self.output_dir = QLineEdit()
@@ -249,9 +294,9 @@ class MainWindow(QMainWindow):
         g.addLayout(row2)
         root.addWidget(grp_build)
 
-        # Build Mode + Console
-        h_mc = QHBoxLayout()
-        h_mc.setSpacing(8)
+        # ── Build Mode + Console + Dependencies ──
+        h_row = QHBoxLayout()
+        h_row.setSpacing(8)
 
         grp_mode = QGroupBox("Build Mode")
         vm = QVBoxLayout(grp_mode)
@@ -264,23 +309,44 @@ class MainWindow(QMainWindow):
         self._mode_group.addButton(self.radio_onedir)
         vm.addWidget(self.radio_onefile)
         vm.addWidget(self.radio_onedir)
-        h_mc.addWidget(grp_mode)
+        h_row.addWidget(grp_mode)
 
         grp_console = QGroupBox("Console Options")
         vc = QVBoxLayout(grp_console)
         vc.setContentsMargins(10, 8, 10, 8)
-        self.check_console = QRadioButton("Консоль (--console)")
-        self.check_windowed = QRadioButton("Без консоли (--windowed)")
-        self.check_console.setChecked(True)
+        self.radio_console = QRadioButton("Консоль (--console)")
+        self.radio_windowed = QRadioButton("Без консоли (--windowed)")
+        self.radio_console.setChecked(True)
         self._console_group = QButtonGroup(self)
-        self._console_group.addButton(self.check_console)
-        self._console_group.addButton(self.check_windowed)
-        vc.addWidget(self.check_console)
-        vc.addWidget(self.check_windowed)
-        h_mc.addWidget(grp_console)
-        root.addLayout(h_mc)
+        self._console_group.addButton(self.radio_console)
+        self._console_group.addButton(self.radio_windowed)
+        vc.addWidget(self.radio_console)
+        vc.addWidget(self.radio_windowed)
+        h_row.addWidget(grp_console)
 
-        # Icon
+        grp_deps = QGroupBox("Dependencies")
+        vd = QVBoxLayout(grp_deps)
+        vd.setContentsMargins(10, 8, 10, 8)
+        self.radio_deps_auto = QRadioButton("Авто (PyInstaller решает)")
+        self.radio_deps_collect = QRadioButton("Собрать всё (--collect-all)")
+        self.radio_deps_auto.setChecked(True)
+        self._deps_group = QButtonGroup(self)
+        self._deps_group.addButton(self.radio_deps_auto)
+        self._deps_group.addButton(self.radio_deps_collect)
+        vd.addWidget(self.radio_deps_auto)
+        vd.addWidget(self.radio_deps_collect)
+        h_row.addWidget(grp_deps)
+
+        root.addLayout(h_row)
+
+        # ── Обнаруженные пакеты ──
+        self.deps_info = QLabel("")
+        self.deps_info.setWordWrap(True)
+        self.deps_info.setStyleSheet("color: #555; font-size: 12px; padding: 2px 4px;")
+        self.deps_info.setVisible(False)
+        root.addWidget(self.deps_info)
+
+        # ── Icon ──
         grp_icon = QGroupBox("Icon Settings")
         hi = QHBoxLayout(grp_icon)
         hi.setContentsMargins(10, 8, 10, 8)
@@ -294,7 +360,7 @@ class MainWindow(QMainWindow):
         hi.addWidget(btn_icon)
         root.addWidget(grp_icon)
 
-        # Advanced
+        # ── Advanced Settings ──
         grp_adv = QGroupBox("Advanced Settings")
         va = QVBoxLayout(grp_adv)
         va.setContentsMargins(10, 8, 10, 8)
@@ -304,7 +370,7 @@ class MainWindow(QMainWindow):
         va.addWidget(self.extra_args)
         root.addWidget(grp_adv)
 
-        # Execution
+        # ── Execution ──
         exec_row = QHBoxLayout()
         exec_row.setSpacing(12)
         self.btn_build = QPushButton("Собрать")
@@ -317,26 +383,51 @@ class MainWindow(QMainWindow):
         exec_row.addStretch()
         root.addLayout(exec_row)
 
-        # Log
+        # ── Output ──
         grp_log = QGroupBox("Output")
         vl = QVBoxLayout(grp_log)
         vl.setContentsMargins(4, 4, 4, 4)
         self.log_view = QPlainTextEdit()
         self.log_view.setReadOnly(True)
-        self.log_view.setMinimumHeight(180)
+        self.log_view.setMinimumHeight(160)
         self.log_view.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         vl.addWidget(self.log_view)
         root.addWidget(grp_log, stretch=1)
 
-    # ── Signals ─────────────────────────────────────────────────────
     def _connect_signals(self):
         self.btn_build.clicked.connect(self._start_build)
         self.input_path.textChanged.connect(self._update_build_btn)
+        self.input_path.textChanged.connect(self._scan_imports)
+        self.icon_path.textChanged.connect(self._update_window_icon)
 
     def _update_build_btn(self):
         self.btn_build.setEnabled(bool(self.input_path.text().strip()))
 
-    # ── Browse dialogs ──────────────────────────────────────────────
+    def _update_window_icon(self):
+        """Устанавливает выбранную .ico как иконку окна программы."""
+        ico = self.icon_path.text().strip()
+        if ico and os.path.isfile(ico):
+            self.setWindowIcon(QIcon(ico))
+        else:
+            self.setWindowIcon(QIcon())
+
+    def _scan_imports(self):
+        path = self.input_path.text().strip()
+        if not path:
+            self.deps_info.setVisible(False)
+            self._detected_packages = []
+            return
+        self._detected_packages = detect_imports(path)
+        if self._detected_packages:
+            self.deps_info.setText(
+                f"📦 Обнаружены сторонние пакеты ({len(self._detected_packages)}): "
+                f"{', '.join(self._detected_packages)}"
+            )
+        else:
+            self.deps_info.setText("📦 Сторонние пакеты не обнаружены")
+        self.deps_info.setVisible(True)
+
+    # ── Browse ──
     def _browse_input(self):
         path, _ = QFileDialog.getOpenFileName(
             self, "Выберите Python-файл", "", "Python Files (*.py *.pyw)"
@@ -344,9 +435,7 @@ class MainWindow(QMainWindow):
         if path:
             self.input_path.setText(path)
             if not self.output_name.text():
-                self.output_name.setText(
-                    os.path.splitext(os.path.basename(path))[0]
-                )
+                self.output_name.setText(os.path.splitext(os.path.basename(path))[0])
 
     def _browse_output_dir(self):
         d = QFileDialog.getExistingDirectory(self, "Выберите директорию")
@@ -360,11 +449,11 @@ class MainWindow(QMainWindow):
         if path:
             self.icon_path.setText(path)
 
-    # ── Build ───────────────────────────────────────────────────────
+    # ── Build ──
     def _build_command(self) -> list[str]:
         cmd = [sys.executable, "-m", "PyInstaller"]
         cmd.append("--onefile" if self.radio_onefile.isChecked() else "--onedir")
-        cmd.append("--console" if self.check_console.isChecked() else "--windowed")
+        cmd.append("--console" if self.radio_console.isChecked() else "--windowed")
 
         name = self.output_name.text().strip()
         if name:
@@ -378,6 +467,10 @@ class MainWindow(QMainWindow):
         if icon:
             cmd += ["--icon", icon]
 
+        if self.radio_deps_collect.isChecked():
+            for pkg in self._detected_packages:
+                cmd += ["--collect-all", pkg]
+
         extra = self.extra_args.text().strip()
         if extra:
             cmd += shlex.split(extra)
@@ -390,7 +483,8 @@ class MainWindow(QMainWindow):
             self.btn_build, self.input_path, self.output_name,
             self.output_dir, self.icon_path, self.extra_args,
             self.radio_onefile, self.radio_onedir,
-            self.check_console, self.check_windowed,
+            self.radio_console, self.radio_windowed,
+            self.radio_deps_auto, self.radio_deps_collect,
         ):
             w.setEnabled(not locked)
         if not locked:
@@ -405,6 +499,9 @@ class MainWindow(QMainWindow):
         cmd = self._build_command()
         self._set_status("⏳ Выполняется…", "#E8A317")
         self._set_ui_locked(True)
+
+        if self.radio_deps_collect.isChecked() and self._detected_packages:
+            self._log(f"📦 --collect-all для: {', '.join(self._detected_packages)}\n")
 
         src = self.input_path.text().strip()
         self.worker = BuildWorker(src, cmd, cwd=os.path.dirname(src) or None)
