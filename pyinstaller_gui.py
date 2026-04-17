@@ -160,16 +160,62 @@ IMPORT_TO_PACKAGE: dict[str, str] = {
     "lxml": "lxml",
 }
 
-ICON_PATCH_CODE = '''
-# --- PyInstaller Builder: auto icon patch ---
-import sys as _sys
-if _sys.platform == "win32":
+# Runtime hook — выполняется ДО основного скрипта внутри собранного .exe
+# 1. Устанавливает AppUserModelID чтобы Windows показывала иконку .exe на панели задач
+# 2. Бандлит .ico внутрь exe и monkey-патчит QApplication чтобы иконка
+#    автоматически ставилась в заголовок окна при создании приложения
+RUNTIME_HOOK_CODE = '''
+import sys, os
+
+# --- AppUserModelID: Windows будет показывать иконку .exe вместо python.exe ---
+if sys.platform == "win32":
     try:
-        import ctypes as _ctypes
-        _ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("pyinstaller.builder.app")
+        import ctypes
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(u"pyinstaller.builder.app")
     except Exception:
         pass
-# --- end icon patch ---
+
+# --- Найти забандленную иконку ---
+_base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
+_ico_path = os.path.join(_base, "_app_icon.ico")
+if not os.path.isfile(_ico_path):
+    _ico_path = None
+
+# --- Monkey-patch QApplication чтобы иконка ставилась автоматически ---
+if _ico_path:
+    def _patch_qapp():
+        """Патчим QApplication.__init__ — после создания приложения ставим иконку."""
+        _qt_modules = [
+            ("PySide6.QtWidgets", "PySide6.QtGui"),
+            ("PySide6.QtWidgets", "PySide6.QtGui"),
+            ("PyQt6.QtWidgets", "PyQt6.QtGui"),
+            ("PyQt5.QtWidgets", "PyQt5.QtGui"),
+        ]
+        for widgets_mod, gui_mod in _qt_modules:
+            try:
+                import importlib
+                _widgets = importlib.import_module(widgets_mod)
+                _gui = importlib.import_module(gui_mod)
+                _QApp = getattr(_widgets, "QApplication")
+                _QIcon = getattr(_gui, "QIcon")
+                _orig_init = _QApp.__init__
+
+                def _new_init(_self, *args, _orig=_orig_init, _icon_cls=_QIcon,
+                              _path=_ico_path, **kwargs):
+                    _orig(_self, *args, **kwargs)
+                    try:
+                        _self.setWindowIcon(_icon_cls(_path))
+                    except Exception:
+                        pass
+
+                _QApp.__init__ = _new_init
+                return
+            except Exception:
+                continue
+    try:
+        _patch_qapp()
+    except Exception:
+        pass
 '''
 
 
@@ -262,41 +308,20 @@ def _safe_icon_path(icon_path: str) -> tuple[str, str | None]:
     return safe_path, tmp_dir
 
 
-def _create_patched_script(py_path: str) -> tuple[str, str]:
-    source = Path(py_path).read_text(encoding="utf-8", errors="replace")
+def _create_icon_embed_files(icon_path: str) -> tuple[str, str, str]:
+    """Создаёт временную папку с:
+    - _app_icon.ico (копия иконки с ASCII-именем)
+    - _runtime_hook.py (хук для автоустановки иконки)
+    Возвращает (путь_к_иконке, путь_к_хуку, временная_папка)."""
+    tmp_dir = tempfile.mkdtemp(prefix="pyibuild_embed_")
 
-    if "SetCurrentProcessExplicitAppUserModelID" in source:
-        return py_path, ""
+    ico_dest = os.path.join(tmp_dir, "_app_icon.ico")
+    shutil.copy2(icon_path, ico_dest)
 
-    lines = source.splitlines(keepends=True)
-    insert_pos = 0
+    hook_path = os.path.join(tmp_dir, "_runtime_hook.py")
+    Path(hook_path).write_text(RUNTIME_HOOK_CODE, encoding="utf-8")
 
-    for i, line in enumerate(lines):
-        stripped = line.strip()
-        if i == 0 and stripped.startswith("#!"):
-            insert_pos = 1
-            continue
-        if i <= 1 and stripped.startswith("#") and "coding" in stripped:
-            insert_pos = i + 1
-            continue
-        break
-
-    rest = "".join(lines[insert_pos:]).lstrip()
-    if rest.startswith(('"""', "'''", '"', "'")):
-        try:
-            tree = ast.parse(source)
-            if (tree.body and isinstance(tree.body[0], ast.Expr)
-                    and isinstance(tree.body[0].value, (ast.Constant, ast.Str))):
-                insert_pos = tree.body[0].end_lineno
-        except Exception:
-            pass
-
-    patched = "".join(lines[:insert_pos]) + ICON_PATCH_CODE + "".join(lines[insert_pos:])
-
-    tmp_dir = tempfile.mkdtemp(prefix="pyibuild_src_")
-    tmp_file = os.path.join(tmp_dir, os.path.basename(py_path))
-    Path(tmp_file).write_text(patched, encoding="utf-8")
-    return tmp_file, tmp_dir
+    return ico_dest, hook_path, tmp_dir
 
 
 def _popen_flags() -> int:
@@ -374,11 +399,10 @@ class BuildWorker(QThread):
         return True
 
     def _ensure_packages(self) -> bool:
-        """Проверяет каждый пакет в целевом Python и доустанавливает недостающие."""
         if not self.packages:
             return True
 
-        missing: list[str] = []
+        missing: list[tuple[str, str]] = []
         for pkg in self.packages:
             pip_name = IMPORT_TO_PACKAGE.get(pkg, pkg)
             try:
@@ -586,7 +610,7 @@ class MainWindow(QMainWindow):
         ve = QVBoxLayout(grp_embed)
         ve.setContentsMargins(10, 8, 10, 8)
         self.radio_icon_off = QRadioButton("Не менять (по умолчанию)")
-        self.radio_icon_embed = QRadioButton("Привязать иконку .exe к окну")
+        self.radio_icon_embed = QRadioButton("Привязать иконку к окну и панели задач")
         self.radio_icon_off.setChecked(True)
         self._icon_embed_group = QButtonGroup(self)
         self._icon_embed_group.addButton(self.radio_icon_off)
@@ -726,14 +750,6 @@ class MainWindow(QMainWindow):
         python = self._python_exe
         src = self.input_path.text().strip()
 
-        if self.radio_icon_embed.isChecked():
-            patched_src, tmp_src = _create_patched_script(src)
-            if tmp_src:
-                temp_dirs.append(tmp_src)
-            build_src = patched_src
-        else:
-            build_src = src
-
         cmd = [python, "-m", "PyInstaller"]
         cmd.append("--onefile" if self.radio_onefile.isChecked() else "--onedir")
         cmd.append("--console" if self.radio_console.isChecked() else "--windowed")
@@ -754,6 +770,14 @@ class MainWindow(QMainWindow):
                 temp_dirs.append(tmp_ico)
             cmd += ["--icon", safe_icon]
 
+            # Привязка иконки к окну приложения через runtime hook
+            if self.radio_icon_embed.isChecked():
+                ico_data, hook_path, tmp_embed = _create_icon_embed_files(icon)
+                temp_dirs.append(tmp_embed)
+                sep = ";" if sys.platform == "win32" else ":"
+                cmd += ["--add-data", f"{ico_data}{sep}."]
+                cmd += ["--runtime-hook", hook_path]
+
         if self.radio_deps_collect.isChecked():
             for pkg in self._detected_packages:
                 cmd += ["--hidden-import", pkg]
@@ -766,7 +790,7 @@ class MainWindow(QMainWindow):
         if extra:
             cmd += shlex.split(extra)
 
-        cmd.append(build_src)
+        cmd.append(src)
         return cmd, temp_dirs
 
     def _set_ui_locked(self, locked: bool):
@@ -803,12 +827,11 @@ class MainWindow(QMainWindow):
 
         icon = self.icon_path.text().strip()
         if icon:
-            self._log(f"🎨 Иконка: {icon}\n")
+            self._log(f"🎨 Иконка .exe: {icon}\n")
 
-        if self.radio_icon_embed.isChecked():
-            self._log("🔗 Привязка иконки к окну: включена (auto-patch)\n")
+        if self.radio_icon_embed.isChecked() and icon:
+            self._log("🔗 Привязка иконки к окну: runtime hook + --add-data\n")
 
-        # Передаём список пакетов для автоустановки
         packages = self._detected_packages if self.radio_deps_collect.isChecked() else []
 
         src = self.input_path.text().strip()
