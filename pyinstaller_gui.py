@@ -2,6 +2,8 @@ import sys
 import os
 import ast
 import shlex
+import shutil
+import tempfile
 import subprocess
 from pathlib import Path
 from PySide6.QtWidgets import (
@@ -137,6 +139,93 @@ STDLIB_MODULES: set[str] = set(sys.stdlib_module_names) if hasattr(sys, "stdlib_
     "_thread", "__future__",
 }
 
+IMPORT_TO_PACKAGE: dict[str, str] = {
+    "cv2": "opencv-python",
+    "PIL": "Pillow",
+    "sklearn": "scikit-learn",
+    "skimage": "scikit-image",
+    "attr": "attrs",
+    "bs4": "beautifulsoup4",
+    "dateutil": "python-dateutil",
+    "dotenv": "python-dotenv",
+    "gi": "PyGObject",
+    "google": "google-api-python-client",
+    "yaml": "PyYAML",
+    "serial": "pyserial",
+    "usb": "pyusb",
+    "wx": "wxPython",
+    "Crypto": "pycryptodome",
+    "nacl": "PyNaCl",
+    "jwt": "PyJWT",
+    "lxml": "lxml",
+}
+
+ICON_PATCH_CODE = '''
+# --- PyInstaller Builder: auto icon patch ---
+import sys as _sys
+if _sys.platform == "win32":
+    try:
+        import ctypes as _ctypes
+        _ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("pyinstaller.builder.app")
+    except Exception:
+        pass
+# --- end icon patch ---
+'''
+
+
+def _find_python() -> str | None:
+    if not getattr(sys, "frozen", False):
+        return sys.executable
+
+    for name in ("python.exe", "python3.exe", "python"):
+        found = shutil.which(name)
+        if found:
+            try:
+                r = subprocess.run(
+                    [found, "--version"],
+                    capture_output=True, text=True, timeout=5,
+                    encoding="utf-8", errors="replace",
+                    creationflags=_popen_flags(),
+                )
+                if r.returncode == 0 and "Python" in r.stdout:
+                    return found
+            except Exception:
+                continue
+
+    if sys.platform == "win32":
+        local_python = os.path.join(
+            os.environ.get("LOCALAPPDATA", ""), "Programs", "Python"
+        )
+        if os.path.isdir(local_python):
+            for d in sorted(os.listdir(local_python), reverse=True):
+                candidate = os.path.join(local_python, d, "python.exe")
+                if os.path.isfile(candidate):
+                    return candidate
+
+        for base in [os.path.expanduser("~"), "C:\\"]:
+            pdir = os.path.join(base, "Python")
+            if not os.path.isdir(pdir):
+                continue
+            for root_dir, dirs, files in os.walk(pdir):
+                if "python.exe" in files:
+                    candidate = os.path.join(root_dir, "python.exe")
+                    try:
+                        r = subprocess.run(
+                            [candidate, "--version"],
+                            capture_output=True, text=True, timeout=5,
+                            encoding="utf-8", errors="replace",
+                            creationflags=_popen_flags(),
+                        )
+                        if r.returncode == 0 and "Python" in r.stdout:
+                            return candidate
+                    except Exception:
+                        continue
+                dirs[:] = [dd for dd in dirs if not dd.startswith(".")]
+                if len(dirs) > 20:
+                    break
+
+    return None
+
 
 def detect_imports(py_path: str) -> list[str]:
     try:
@@ -160,6 +249,56 @@ def detect_imports(py_path: str) -> list[str]:
     )
 
 
+def _safe_icon_path(icon_path: str) -> tuple[str, str | None]:
+    try:
+        icon_path.encode("ascii")
+        return icon_path, None
+    except UnicodeEncodeError:
+        pass
+    tmp_dir = tempfile.mkdtemp(prefix="pyibuild_ico_")
+    ext = os.path.splitext(icon_path)[1] or ".ico"
+    safe_path = os.path.join(tmp_dir, f"icon{ext}")
+    shutil.copy2(icon_path, safe_path)
+    return safe_path, tmp_dir
+
+
+def _create_patched_script(py_path: str) -> tuple[str, str]:
+    source = Path(py_path).read_text(encoding="utf-8", errors="replace")
+
+    if "SetCurrentProcessExplicitAppUserModelID" in source:
+        return py_path, ""
+
+    lines = source.splitlines(keepends=True)
+    insert_pos = 0
+
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        if i == 0 and stripped.startswith("#!"):
+            insert_pos = 1
+            continue
+        if i <= 1 and stripped.startswith("#") and "coding" in stripped:
+            insert_pos = i + 1
+            continue
+        break
+
+    rest = "".join(lines[insert_pos:]).lstrip()
+    if rest.startswith(('"""', "'''", '"', "'")):
+        try:
+            tree = ast.parse(source)
+            if (tree.body and isinstance(tree.body[0], ast.Expr)
+                    and isinstance(tree.body[0].value, (ast.Constant, ast.Str))):
+                insert_pos = tree.body[0].end_lineno
+        except Exception:
+            pass
+
+    patched = "".join(lines[:insert_pos]) + ICON_PATCH_CODE + "".join(lines[insert_pos:])
+
+    tmp_dir = tempfile.mkdtemp(prefix="pyibuild_src_")
+    tmp_file = os.path.join(tmp_dir, os.path.basename(py_path))
+    Path(tmp_file).write_text(patched, encoding="utf-8")
+    return tmp_file, tmp_dir
+
+
 def _popen_flags() -> int:
     return subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
 
@@ -169,11 +308,16 @@ class BuildWorker(QThread):
     error_signal = Signal(str)
     finished_signal = Signal(int)
 
-    def __init__(self, py_file: str, command: list[str], cwd: str | None = None):
+    def __init__(self, python_exe: str, py_file: str, command: list[str],
+                 packages: list[str] | None = None,
+                 cwd: str | None = None, temp_dirs: list[str] | None = None):
         super().__init__()
+        self.python_exe = python_exe
         self.py_file = py_file
         self.command = command
+        self.packages = packages or []
         self.cwd = cwd
+        self.temp_dirs = temp_dirs or []
 
     def _run_process(self, cmd: list[str], label: str) -> int:
         self.log_signal.emit(f"[{label}] > {' '.join(cmd)}\n")
@@ -203,7 +347,7 @@ class BuildWorker(QThread):
     def _ensure_pyinstaller(self) -> bool:
         try:
             r = subprocess.run(
-                [sys.executable, "-m", "PyInstaller", "--version"],
+                [self.python_exe, "-m", "PyInstaller", "--version"],
                 capture_output=True, text=True,
                 encoding="utf-8", errors="replace",
                 creationflags=_popen_flags(),
@@ -217,8 +361,8 @@ class BuildWorker(QThread):
 
         self.log_signal.emit("PyInstaller не найден — устанавливаю автоматически…\n")
         code = self._run_process(
-            [sys.executable, "-m", "pip", "install", "pyinstaller"],
-            "pip install",
+            [self.python_exe, "-m", "pip", "install", "pyinstaller"],
+            "pip install pyinstaller",
         )
         if code != 0:
             self.error_signal.emit(
@@ -229,11 +373,72 @@ class BuildWorker(QThread):
         self.log_signal.emit("\nPyInstaller успешно установлен.\n")
         return True
 
+    def _ensure_packages(self) -> bool:
+        """Проверяет каждый пакет в целевом Python и доустанавливает недостающие."""
+        if not self.packages:
+            return True
+
+        missing: list[str] = []
+        for pkg in self.packages:
+            pip_name = IMPORT_TO_PACKAGE.get(pkg, pkg)
+            try:
+                r = subprocess.run(
+                    [self.python_exe, "-c", f"import {pkg}"],
+                    capture_output=True, text=True,
+                    encoding="utf-8", errors="replace",
+                    timeout=15,
+                    creationflags=_popen_flags(),
+                )
+                if r.returncode != 0:
+                    missing.append((pkg, pip_name))
+            except Exception:
+                missing.append((pkg, pip_name))
+
+        if not missing:
+            self.log_signal.emit("✅ Все зависимости уже установлены в целевом Python\n")
+            return True
+
+        missing_names = [f"{imp} (pip: {pip})" for imp, pip in missing]
+        self.log_signal.emit(
+            f"📥 Недостающие пакеты в целевом Python: {', '.join(missing_names)}\n"
+        )
+
+        pip_packages = list(dict.fromkeys(pip for _, pip in missing))
+        code = self._run_process(
+            [self.python_exe, "-m", "pip", "install"] + pip_packages,
+            "pip install deps",
+        )
+        if code != 0:
+            self.error_signal.emit(
+                f"Не удалось установить пакеты: {', '.join(pip_packages)}. "
+                "Проверьте подключение к интернету."
+            )
+            return False
+
+        self.log_signal.emit("\n✅ Все зависимости установлены.\n")
+        return True
+
+    def _cleanup_temp(self):
+        for d in self.temp_dirs:
+            if d:
+                try:
+                    shutil.rmtree(d, ignore_errors=True)
+                except Exception:
+                    pass
+
     def run(self):
         if not self._ensure_pyinstaller():
+            self._cleanup_temp()
             self.finished_signal.emit(-1)
             return
+
+        if not self._ensure_packages():
+            self._cleanup_temp()
+            self.finished_signal.emit(-1)
+            return
+
         code = self._run_process(self.command, "PyInstaller")
+        self._cleanup_temp()
         self.finished_signal.emit(code)
 
 
@@ -241,13 +446,28 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("PyInstaller Builder")
-        self.setMinimumSize(720, 780)
-        self.resize(780, 860)
+        self.setMinimumSize(720, 860)
+        self.resize(800, 960)
         self.worker: BuildWorker | None = None
         self._detected_packages: list[str] = []
+        self._python_exe: str | None = None
         self._build_ui()
         self._connect_signals()
+        self._detect_python()
         self._update_build_btn()
+
+    def _detect_python(self):
+        self._python_exe = _find_python()
+        if self._python_exe:
+            self.python_path_edit.setText(self._python_exe)
+            self.python_info.setText(f"🐍 Python: {self._python_exe}")
+            self.python_info.setStyleSheet("color: #16825D; font-size: 12px; padding: 2px 4px;")
+        else:
+            self.python_info.setText(
+                "⚠️ Python не найден! Укажите путь вручную через «Обзор»"
+            )
+            self.python_info.setStyleSheet("color: #D32F2F; font-size: 12px; padding: 2px 4px;")
+        self.python_info.setVisible(True)
 
     def _build_ui(self):
         central = QWidget()
@@ -255,6 +475,25 @@ class MainWindow(QMainWindow):
         root = QVBoxLayout(central)
         root.setContentsMargins(16, 12, 16, 12)
         root.setSpacing(8)
+
+        # ── Python interpreter ──
+        grp_python = QGroupBox("Python Interpreter")
+        hp = QHBoxLayout(grp_python)
+        hp.setContentsMargins(10, 8, 10, 8)
+        self.python_path_edit = QLineEdit()
+        self.python_path_edit.setPlaceholderText("Определяется автоматически…")
+        self.python_path_edit.setReadOnly(True)
+        btn_python = QPushButton("Обзор…")
+        btn_python.setFixedWidth(90)
+        btn_python.clicked.connect(self._browse_python)
+        hp.addWidget(self.python_path_edit)
+        hp.addWidget(btn_python)
+        root.addWidget(grp_python)
+
+        self.python_info = QLabel("")
+        self.python_info.setWordWrap(True)
+        self.python_info.setVisible(False)
+        root.addWidget(self.python_info)
 
         # ── Исходный файл ──
         grp_input = QGroupBox("Исходный файл")
@@ -294,9 +533,9 @@ class MainWindow(QMainWindow):
         g.addLayout(row2)
         root.addWidget(grp_build)
 
-        # ── Build Mode + Console + Dependencies ──
-        h_row = QHBoxLayout()
-        h_row.setSpacing(8)
+        # ── Build Mode + Console ──
+        h_row1 = QHBoxLayout()
+        h_row1.setSpacing(8)
 
         grp_mode = QGroupBox("Build Mode")
         vm = QVBoxLayout(grp_mode)
@@ -309,7 +548,7 @@ class MainWindow(QMainWindow):
         self._mode_group.addButton(self.radio_onedir)
         vm.addWidget(self.radio_onefile)
         vm.addWidget(self.radio_onedir)
-        h_row.addWidget(grp_mode)
+        h_row1.addWidget(grp_mode)
 
         grp_console = QGroupBox("Console Options")
         vc = QVBoxLayout(grp_console)
@@ -322,7 +561,13 @@ class MainWindow(QMainWindow):
         self._console_group.addButton(self.radio_windowed)
         vc.addWidget(self.radio_console)
         vc.addWidget(self.radio_windowed)
-        h_row.addWidget(grp_console)
+        h_row1.addWidget(grp_console)
+
+        root.addLayout(h_row1)
+
+        # ── Dependencies + Icon Embed ──
+        h_row2 = QHBoxLayout()
+        h_row2.setSpacing(8)
 
         grp_deps = QGroupBox("Dependencies")
         vd = QVBoxLayout(grp_deps)
@@ -335,9 +580,22 @@ class MainWindow(QMainWindow):
         self._deps_group.addButton(self.radio_deps_collect)
         vd.addWidget(self.radio_deps_auto)
         vd.addWidget(self.radio_deps_collect)
-        h_row.addWidget(grp_deps)
+        h_row2.addWidget(grp_deps)
 
-        root.addLayout(h_row)
+        grp_embed = QGroupBox("Иконка в заголовке окна")
+        ve = QVBoxLayout(grp_embed)
+        ve.setContentsMargins(10, 8, 10, 8)
+        self.radio_icon_off = QRadioButton("Не менять (по умолчанию)")
+        self.radio_icon_embed = QRadioButton("Привязать иконку .exe к окну")
+        self.radio_icon_off.setChecked(True)
+        self._icon_embed_group = QButtonGroup(self)
+        self._icon_embed_group.addButton(self.radio_icon_off)
+        self._icon_embed_group.addButton(self.radio_icon_embed)
+        ve.addWidget(self.radio_icon_off)
+        ve.addWidget(self.radio_icon_embed)
+        h_row2.addWidget(grp_embed)
+
+        root.addLayout(h_row2)
 
         # ── Обнаруженные пакеты ──
         self.deps_info = QLabel("")
@@ -389,7 +647,7 @@ class MainWindow(QMainWindow):
         vl.setContentsMargins(4, 4, 4, 4)
         self.log_view = QPlainTextEdit()
         self.log_view.setReadOnly(True)
-        self.log_view.setMinimumHeight(160)
+        self.log_view.setMinimumHeight(140)
         self.log_view.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         vl.addWidget(self.log_view)
         root.addWidget(grp_log, stretch=1)
@@ -401,10 +659,11 @@ class MainWindow(QMainWindow):
         self.icon_path.textChanged.connect(self._update_window_icon)
 
     def _update_build_btn(self):
-        self.btn_build.setEnabled(bool(self.input_path.text().strip()))
+        has_file = bool(self.input_path.text().strip())
+        has_python = self._python_exe is not None
+        self.btn_build.setEnabled(has_file and has_python)
 
     def _update_window_icon(self):
-        """Устанавливает выбранную .ico как иконку окна программы."""
         ico = self.icon_path.text().strip()
         if ico and os.path.isfile(ico):
             self.setWindowIcon(QIcon(ico))
@@ -428,6 +687,18 @@ class MainWindow(QMainWindow):
         self.deps_info.setVisible(True)
 
     # ── Browse ──
+    def _browse_python(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Выберите python.exe", "",
+            "Python (python.exe python3.exe);;All Files (*)"
+        )
+        if path:
+            self._python_exe = path
+            self.python_path_edit.setText(path)
+            self.python_info.setText(f"🐍 Python (вручную): {path}")
+            self.python_info.setStyleSheet("color: #16825D; font-size: 12px; padding: 2px 4px;")
+            self._update_build_btn()
+
     def _browse_input(self):
         path, _ = QFileDialog.getOpenFileName(
             self, "Выберите Python-файл", "", "Python Files (*.py *.pyw)"
@@ -450,10 +721,23 @@ class MainWindow(QMainWindow):
             self.icon_path.setText(path)
 
     # ── Build ──
-    def _build_command(self) -> list[str]:
-        cmd = [sys.executable, "-m", "PyInstaller"]
+    def _build_command(self) -> tuple[list[str], list[str]]:
+        temp_dirs: list[str] = []
+        python = self._python_exe
+        src = self.input_path.text().strip()
+
+        if self.radio_icon_embed.isChecked():
+            patched_src, tmp_src = _create_patched_script(src)
+            if tmp_src:
+                temp_dirs.append(tmp_src)
+            build_src = patched_src
+        else:
+            build_src = src
+
+        cmd = [python, "-m", "PyInstaller"]
         cmd.append("--onefile" if self.radio_onefile.isChecked() else "--onedir")
         cmd.append("--console" if self.radio_console.isChecked() else "--windowed")
+        cmd.append("--noconfirm")
 
         name = self.output_name.text().strip()
         if name:
@@ -464,19 +748,26 @@ class MainWindow(QMainWindow):
             cmd += ["--distpath", dist]
 
         icon = self.icon_path.text().strip()
-        if icon:
-            cmd += ["--icon", icon]
+        if icon and os.path.isfile(icon):
+            safe_icon, tmp_ico = _safe_icon_path(icon)
+            if tmp_ico:
+                temp_dirs.append(tmp_ico)
+            cmd += ["--icon", safe_icon]
 
         if self.radio_deps_collect.isChecked():
             for pkg in self._detected_packages:
+                cmd += ["--hidden-import", pkg]
                 cmd += ["--collect-all", pkg]
+                pip_name = IMPORT_TO_PACKAGE.get(pkg)
+                if pip_name and pip_name != pkg:
+                    cmd += ["--collect-all", pip_name]
 
         extra = self.extra_args.text().strip()
         if extra:
             cmd += shlex.split(extra)
 
-        cmd.append(self.input_path.text().strip())
-        return cmd
+        cmd.append(build_src)
+        return cmd, temp_dirs
 
     def _set_ui_locked(self, locked: bool):
         for w in (
@@ -485,6 +776,7 @@ class MainWindow(QMainWindow):
             self.radio_onefile, self.radio_onedir,
             self.radio_console, self.radio_windowed,
             self.radio_deps_auto, self.radio_deps_collect,
+            self.radio_icon_off, self.radio_icon_embed,
         ):
             w.setEnabled(not locked)
         if not locked:
@@ -495,16 +787,37 @@ class MainWindow(QMainWindow):
         self.status_label.setStyleSheet(f"color: {color}; font-weight: 600;")
 
     def _start_build(self):
+        if not self._python_exe:
+            self._log_error("Python не найден! Укажите путь в секции Python Interpreter.")
+            return
+
         self.log_view.clear()
-        cmd = self._build_command()
+        cmd, temp_dirs = self._build_command()
         self._set_status("⏳ Выполняется…", "#E8A317")
         self._set_ui_locked(True)
 
+        self._log(f"🐍 Используется Python: {self._python_exe}\n")
+
         if self.radio_deps_collect.isChecked() and self._detected_packages:
-            self._log(f"📦 --collect-all для: {', '.join(self._detected_packages)}\n")
+            self._log(f"📦 --hidden-import + --collect-all для: {', '.join(self._detected_packages)}\n")
+
+        icon = self.icon_path.text().strip()
+        if icon:
+            self._log(f"🎨 Иконка: {icon}\n")
+
+        if self.radio_icon_embed.isChecked():
+            self._log("🔗 Привязка иконки к окну: включена (auto-patch)\n")
+
+        # Передаём список пакетов для автоустановки
+        packages = self._detected_packages if self.radio_deps_collect.isChecked() else []
 
         src = self.input_path.text().strip()
-        self.worker = BuildWorker(src, cmd, cwd=os.path.dirname(src) or None)
+        self.worker = BuildWorker(
+            self._python_exe, src, cmd,
+            packages=packages,
+            cwd=os.path.dirname(src) or None,
+            temp_dirs=temp_dirs,
+        )
         self.worker.log_signal.connect(self._log)
         self.worker.error_signal.connect(self._log_error)
         self.worker.finished_signal.connect(self._build_finished)
